@@ -1,350 +1,408 @@
-import express from 'express';
-import cors from 'cors';
-import dotenv from 'dotenv';
-import sqlite3 from 'sqlite3';
-import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
-
-dotenv.config();
+const express = require('express');
+const sqlite3 = require('sqlite3').verbose();
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const cors = require('cors');
+const mercadopago = require('mercadopago');
 
 const app = express();
-const PORT = process.env.PORT || 3001;
-const JWT_SECRET = process.env.JWT_SECRET || 'tu-secreto-super-seguro-cambiar-en-produccion';
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 
-// ═══════════════════════════════════════════════════════════
-// INICIALIZAR BASE DE DATOS
-// ═══════════════════════════════════════════════════════════
-
-const db = new sqlite3.Database('./memori.db', (err) => {
-  if (err) console.error('Error conectando DB:', err);
-  else console.log('✅ Base de datos SQLite conectada');
+// Configuración de Mercado Pago
+mercadopago.configure({
+  access_token: process.env.MERCADO_PAGO_ACCESS_TOKEN
 });
+
+// Conexión a SQLite
+const db = new sqlite3.Database(process.env.DATABASE_URL || ':memory:');
 
 // Crear tablas si no existen
 db.serialize(() => {
-  // Tabla de usuarios (papás)
   db.run(`
     CREATE TABLE IF NOT EXISTS usuarios (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       email TEXT UNIQUE NOT NULL,
       nombre TEXT NOT NULL,
       password TEXT NOT NULL,
-      plan TEXT DEFAULT 'gratuito',
-      estado_pago TEXT DEFAULT 'pendiente',
-      mercado_pago_id TEXT,
+      plan TEXT DEFAULT 'GRATUITO',
+      estado_pago TEXT DEFAULT 'no_pagado',
       fecha_registro DATETIME DEFAULT CURRENT_TIMESTAMP,
-      fecha_expiracion DATETIME,
-      activo INTEGER DEFAULT 1
+      activo BOOLEAN DEFAULT 1
     )
   `);
 
-  // Tabla de hijos
   db.run(`
     CREATE TABLE IF NOT EXISTS hijos (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       usuario_id INTEGER NOT NULL,
       nombre TEXT NOT NULL,
-      edad INTEGER,
+      apodo TEXT,
       fecha_nacimiento DATE,
-      fecha_creacion DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY(usuario_id) REFERENCES usuarios(id) ON DELETE CASCADE
+      FOREIGN KEY (usuario_id) REFERENCES usuarios(id)
     )
   `);
 
-  // Tabla de pagos
   db.run(`
     CREATE TABLE IF NOT EXISTS pagos (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       usuario_id INTEGER NOT NULL,
       plan TEXT NOT NULL,
       monto REAL NOT NULL,
-      moneda TEXT DEFAULT 'CLP',
-      mercado_pago_id TEXT UNIQUE,
+      mercado_pago_id TEXT,
       estado TEXT DEFAULT 'pendiente',
       fecha_pago DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY(usuario_id) REFERENCES usuarios(id) ON DELETE CASCADE
+      FOREIGN KEY (usuario_id) REFERENCES usuarios(id)
     )
   `);
-
-  console.log('✅ Tablas creadas/verificadas');
 });
 
-// ═══════════════════════════════════════════════════════════
-// FUNCIONES HELPER
-// ═══════════════════════════════════════════════════════════
-
-const generarToken = (usuarioId) => {
-  return jwt.sign({ id: usuarioId }, JWT_SECRET, { expiresIn: '30d' });
-};
-
-const verificarToken = (token) => {
-  try {
-    return jwt.verify(token, JWT_SECRET);
-  } catch (error) {
-    return null;
-  }
-};
-
-const hashPassword = async (password) => {
-  return await bcrypt.hash(password, 10);
-};
-
-const compararPassword = async (password, hash) => {
-  return await bcrypt.compare(password, hash);
-};
-
-// Middleware para verificar autenticación
-const autenticar = (req, res, next) => {
+// Helper: verificar JWT
+const verificarToken = (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
-  
-  if (!token) {
-    return res.status(401).json({ error: 'Token no proporcionado' });
-  }
+  if (!token) return res.status(401).json({ error: 'No autorizado' });
 
-  const decoded = verificarToken(token);
-  if (!decoded) {
-    return res.status(401).json({ error: 'Token inválido o expirado' });
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'tu_super_secret_key');
+    req.usuario_id = decoded.usuario_id;
+    next();
+  } catch (err) {
+    res.status(401).json({ error: 'Token inválido' });
   }
-
-  req.usuarioId = decoded.id;
-  next();
 };
 
-// ═══════════════════════════════════════════════════════════
-// RUTAS DE AUTENTICACIÓN
-// ═══════════════════════════════════════════════════════════
+// ========== AUTENTICACIÓN ==========
 
-// REGISTRO
-app.post('/api/auth/registro', async (req, res) => {
-  try {
-    const { email, nombre, password, plan } = req.body;
+// Registro
+app.post('/api/auth/registro', (req, res) => {
+  const { email, nombre, password, hijos } = req.body;
 
-    if (!email || !nombre || !password) {
-      return res.status(400).json({ error: 'Faltan datos requeridos' });
-    }
+  if (!email || !nombre || !password) {
+    return res.status(400).json({ error: 'Faltan datos' });
+  }
 
-    // Verificar si el email ya existe
-    db.get('SELECT id FROM usuarios WHERE email = ?', [email], async (err, usuario) => {
-      if (usuario) {
-        return res.status(400).json({ error: 'Este email ya está registrado' });
+  const hashedPassword = bcrypt.hashSync(password, 10);
+
+  db.run(
+    'INSERT INTO usuarios (email, nombre, password) VALUES (?, ?, ?)',
+    [email, nombre, hashedPassword],
+    function (err) {
+      if (err) {
+        return res.status(400).json({ error: 'Email ya registrado' });
       }
 
-      // Hashear password
-      const passwordHash = await hashPassword(password);
+      const usuario_id = this.lastID;
 
-      // Insertar usuario
-      db.run(
-        `INSERT INTO usuarios (email, nombre, password, plan) VALUES (?, ?, ?, ?)`,
-        [email, nombre, passwordHash, plan || 'gratuito'],
-        function (err) {
-          if (err) {
-            return res.status(500).json({ error: 'Error al registrar usuario' });
-          }
-
-          const token = generarToken(this.lastID);
-          res.json({
-            mensaje: 'Usuario registrado exitosamente',
-            usuarioId: this.lastID,
-            token,
-            plan: plan || 'gratuito'
-          });
-        }
-      );
-    });
-  } catch (error) {
-    res.status(500).json({ error: 'Error en servidor' });
-  }
-});
-
-// LOGIN
-app.post('/api/auth/login', (req, res) => {
-  try {
-    const { email, password } = req.body;
-
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email y contraseña requeridos' });
-    }
-
-    db.get('SELECT * FROM usuarios WHERE email = ?', [email], async (err, usuario) => {
-      if (!usuario) {
-        return res.status(401).json({ error: 'Email o contraseña incorrectos' });
-      }
-
-      const passwordValida = await compararPassword(password, usuario.password);
-      if (!passwordValida) {
-        return res.status(401).json({ error: 'Email o contraseña incorrectos' });
-      }
-
-      const token = generarToken(usuario.id);
-      res.json({
-        mensaje: 'Login exitoso',
-        usuarioId: usuario.id,
-        token,
-        nombre: usuario.nombre,
-        email: usuario.email,
-        plan: usuario.plan
-      });
-    });
-  } catch (error) {
-    res.status(500).json({ error: 'Error en servidor' });
-  }
-});
-
-// VERIFICAR TOKEN
-app.post('/api/auth/verificar', (req, res) => {
-  const token = req.headers.authorization?.split(' ')[1];
-  
-  if (!token) {
-    return res.status(401).json({ valido: false });
-  }
-
-  const decoded = verificarToken(token);
-  if (!decoded) {
-    return res.status(401).json({ valido: false });
-  }
-
-  res.json({ valido: true, usuarioId: decoded.id });
-});
-
-// ═══════════════════════════════════════════════════════════
-// RUTAS DE USUARIO
-// ═══════════════════════════════════════════════════════════
-
-// GET perfil del usuario
-app.get('/api/usuario/perfil', autenticar, (req, res) => {
-  db.get('SELECT id, email, nombre, plan, estado_pago FROM usuarios WHERE id = ?', [req.usuarioId], (err, usuario) => {
-    if (!usuario) {
-      return res.status(404).json({ error: 'Usuario no encontrado' });
-    }
-    res.json(usuario);
-  });
-});
-
-// GET hijos del usuario
-app.get('/api/usuario/hijos', autenticar, (req, res) => {
-  db.all('SELECT * FROM hijos WHERE usuario_id = ? ORDER BY fecha_creacion DESC', [req.usuarioId], (err, hijos) => {
-    if (err) {
-      return res.status(500).json({ error: 'Error al obtener hijos' });
-    }
-    res.json(hijos || []);
-  });
-});
-
-// POST crear nuevo hijo
-app.post('/api/usuario/hijos', autenticar, (req, res) => {
-  try {
-    const { nombre, edad, fecha_nacimiento } = req.body;
-
-    if (!nombre) {
-      return res.status(400).json({ error: 'Nombre del hijo requerido' });
-    }
-
-    db.run(
-      `INSERT INTO hijos (usuario_id, nombre, edad, fecha_nacimiento) VALUES (?, ?, ?, ?)`,
-      [req.usuarioId, nombre, edad, fecha_nacimiento],
-      function (err) {
-        if (err) {
-          return res.status(500).json({ error: 'Error al crear hijo' });
-        }
-        res.json({
-          id: this.lastID,
-          nombre,
-          edad,
-          fecha_nacimiento
+      // Insertar hijos si existen
+      if (hijos && Array.isArray(hijos)) {
+        hijos.forEach(hijo => {
+          db.run(
+            'INSERT INTO hijos (usuario_id, nombre, apodo, fecha_nacimiento) VALUES (?, ?, ?, ?)',
+            [usuario_id, hijo.nombre, hijo.apodo, hijo.fecha_nacimiento]
+          );
         });
       }
-    );
-  } catch (error) {
-    res.status(500).json({ error: 'Error en servidor' });
-  }
+
+      const token = jwt.sign(
+        { usuario_id, email },
+        process.env.JWT_SECRET || 'tu_super_secret_key',
+        { expiresIn: '30d' }
+      );
+
+      res.status(201).json({
+        mensaje: 'Usuario registrado',
+        usuario_id,
+        token
+      });
+    }
+  );
 });
 
-// ═══════════════════════════════════════════════════════════
-// RUTAS DE PAGOS (Mercado Pago)
-// ═══════════════════════════════════════════════════════════
+// Login
+app.post('/api/auth/login', (req, res) => {
+  const { email, password } = req.body;
 
-// Simular confirmación de pago (Mercado Pago webhook)
-app.post('/api/pagos/confirmar', (req, res) => {
-  try {
-    const { email, plan, mercado_pago_id } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email y contraseña requeridos' });
+  }
 
-    if (!email || !plan || !mercado_pago_id) {
-      return res.status(400).json({ error: 'Datos incompletos' });
+  db.get('SELECT * FROM usuarios WHERE email = ?', [email], (err, usuario) => {
+    if (err || !usuario) {
+      return res.status(401).json({ error: 'Usuario no encontrado' });
     }
 
-    // Buscar usuario por email
-    db.get('SELECT id FROM usuarios WHERE email = ?', [email], (err, usuario) => {
-      if (!usuario) {
+    const passwordValido = bcrypt.compareSync(password, usuario.password);
+    if (!passwordValido) {
+      return res.status(401).json({ error: 'Contraseña incorrecta' });
+    }
+
+    const token = jwt.sign(
+      { usuario_id: usuario.id, email: usuario.email },
+      process.env.JWT_SECRET || 'tu_super_secret_key',
+      { expiresIn: '30d' }
+    );
+
+    res.json({
+      mensaje: 'Login exitoso',
+      usuario_id: usuario.id,
+      plan: usuario.plan,
+      token
+    });
+  });
+});
+
+// ========== USUARIO ==========
+
+// Obtener perfil
+app.get('/api/usuario/perfil', verificarToken, (req, res) => {
+  db.get(
+    'SELECT id, email, nombre, plan, estado_pago, fecha_registro FROM usuarios WHERE id = ?',
+    [req.usuario_id],
+    (err, usuario) => {
+      if (err || !usuario) {
         return res.status(404).json({ error: 'Usuario no encontrado' });
       }
+      res.json(usuario);
+    }
+  );
+});
 
-      // Guardar pago
+// Obtener hijos del usuario
+app.get('/api/usuario/hijos', verificarToken, (req, res) => {
+  db.all(
+    'SELECT * FROM hijos WHERE usuario_id = ?',
+    [req.usuario_id],
+    (err, hijos) => {
+      if (err) {
+        return res.status(500).json({ error: 'Error al obtener hijos' });
+      }
+      res.json(hijos);
+    }
+  );
+});
+
+// Crear hijo
+app.post('/api/usuario/hijos', verificarToken, (req, res) => {
+  const { nombre, apodo, fecha_nacimiento } = req.body;
+
+  if (!nombre) {
+    return res.status(400).json({ error: 'Nombre del hijo requerido' });
+  }
+
+  db.run(
+    'INSERT INTO hijos (usuario_id, nombre, apodo, fecha_nacimiento) VALUES (?, ?, ?, ?)',
+    [req.usuario_id, nombre, apodo, fecha_nacimiento],
+    function (err) {
+      if (err) {
+        return res.status(500).json({ error: 'Error al crear hijo' });
+      }
+      res.status(201).json({
+        mensaje: 'Hijo agregado',
+        hijo_id: this.lastID
+      });
+    }
+  );
+});
+
+// ========== MERCADO PAGO - CREAR PREFERENCIA DE PAGO ==========
+
+app.post('/api/pagos/crear', verificarToken, (req, res) => {
+  const { plan } = req.body;
+
+  // Validar plan
+  const planes = {
+    'PLAN 1': 4.99,
+    'PLAN 2': 9.99,
+    'PLAN 3': 14.99,
+    'PLAN 4': 19.99
+  };
+
+  if (!planes[plan]) {
+    return res.status(400).json({ error: 'Plan inválido' });
+  }
+
+  const monto = planes[plan];
+
+  // Crear preferencia de Mercado Pago
+  const preference = {
+    items: [
+      {
+        title: plan,
+        quantity: 1,
+        unit_price: monto
+      }
+    ],
+    payer: {
+      email: req.body.email || 'cliente@example.com'
+    },
+    back_urls: {
+      success: 'https://memori.cl/?pago=exitoso',
+      failure: 'https://memori.cl/?pago=fallido',
+      pending: 'https://memori.cl/?pago=pendiente'
+    },
+    external_reference: `memori_${req.usuario_id}_${Date.now()}`,
+    notification_url: 'https://memori-backend-1.onrender.com/api/pagos/webhook'
+  };
+
+  mercadopago.preferences.create(preference)
+    .then(response => {
+      // Guardar el pago en BD (pendiente)
       db.run(
-        `INSERT INTO pagos (usuario_id, plan, monto, mercado_pago_id, estado) 
-         VALUES (?, ?, ?, ?, 'confirmado')`,
-        [usuario.id, plan, 0, mercado_pago_id],
-        function (err) {
+        'INSERT INTO pagos (usuario_id, plan, monto, mercado_pago_id, estado) VALUES (?, ?, ?, ?, ?)',
+        [req.usuario_id, plan, monto, response.body.id, 'pendiente'],
+        (err) => {
           if (err) {
             return res.status(500).json({ error: 'Error al guardar pago' });
           }
 
-          // Actualizar plan del usuario
-          db.run(
-            `UPDATE usuarios SET plan = ?, estado_pago = 'confirmado' WHERE id = ?`,
-            [plan, usuario.id],
-            (err) => {
-              if (err) {
-                return res.status(500).json({ error: 'Error al actualizar plan' });
-              }
+          res.json({
+            init_point: response.body.init_point, // URL para pagar
+            preference_id: response.body.id
+          });
+        }
+      );
+    })
+    .catch(err => {
+      console.error('Error Mercado Pago:', err);
+      res.status(500).json({ error: 'Error al crear pago' });
+    });
+});
 
-              res.json({
-                mensaje: 'Pago confirmado',
-                usuarioId: usuario.id,
-                plan: plan,
-                acceso: true
-              });
+// ========== WEBHOOK - CONFIRMACIÓN AUTOMÁTICA DE PAGO ==========
+
+app.post('/api/pagos/webhook', (req, res) => {
+  const { type, data } = req.body;
+
+  // Solo procesar notificaciones de pago
+  if (type !== 'payment') {
+    return res.sendStatus(200);
+  }
+
+  // Obtener detalles del pago desde Mercado Pago
+  mercadopago.payment.findById(data.id)
+    .then(response => {
+      const pago = response.body;
+      const external_reference = pago.external_reference;
+
+      // Validar que el pago fue aprobado
+      if (pago.status !== 'approved') {
+        return res.sendStatus(200);
+      }
+
+      // Parsear external_reference para obtener usuario_id
+      const usuario_id = parseInt(external_reference.split('_')[1]);
+
+      // Obtener el pago pendiente
+      db.get(
+        'SELECT * FROM pagos WHERE usuario_id = ? AND estado = ? ORDER BY fecha_pago DESC LIMIT 1',
+        [usuario_id, 'pendiente'],
+        (err, pagoPendiente) => {
+          if (err || !pagoPendiente) {
+            return res.sendStatus(200);
+          }
+
+          // Actualizar estado a confirmado
+          db.run(
+            'UPDATE pagos SET estado = ? WHERE id = ?',
+            ['confirmado', pagoPendiente.id],
+            () => {
+              // Actualizar plan del usuario
+              db.run(
+                'UPDATE usuarios SET plan = ?, estado_pago = ? WHERE id = ?',
+                [pagoPendiente.plan, 'pagado', usuario_id],
+                () => {
+                  console.log(`Pago confirmado para usuario ${usuario_id}`);
+                  res.sendStatus(200);
+                }
+              );
             }
           );
         }
       );
+    })
+    .catch(err => {
+      console.error('Error al procesar webhook:', err);
+      res.sendStatus(500);
     });
-  } catch (error) {
-    res.status(500).json({ error: 'Error en servidor' });
-  }
 });
 
-// GET historial de pagos
-app.get('/api/pagos/historial', autenticar, (req, res) => {
-  db.all('SELECT * FROM pagos WHERE usuario_id = ? ORDER BY fecha_pago DESC', [req.usuarioId], (err, pagos) => {
-    if (err) {
-      return res.status(500).json({ error: 'Error al obtener pagos' });
-    }
-    res.json(pagos || []);
+// ========== ADMIN ==========
+
+// Estadísticas
+app.get('/api/admin/stats', (req, res) => {
+  db.all('SELECT COUNT(*) as total FROM usuarios', (err, result) => {
+    const totalUsuarios = result[0].total;
+
+    db.all(
+      "SELECT COUNT(*) as total FROM pagos WHERE estado = 'confirmado'",
+      (err, result) => {
+        const pagosConfirmados = result[0].total;
+
+        db.all(
+          "SELECT COUNT(*) as total FROM pagos WHERE estado = 'pendiente'",
+          (err, result) => {
+            const pagosPendientes = result[0].total;
+
+            res.json({
+              totalUsuarios,
+              pagosConfirmados,
+              pagosPendientes
+            });
+          }
+        );
+      }
+    );
   });
 });
 
-// ═══════════════════════════════════════════════════════════
-// RUTA DE SALUD (verificar que el servidor está vivo)
-// ═══════════════════════════════════════════════════════════
-
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'Backend de memori funcionando ✅' });
+// Lista de usuarios
+app.get('/api/admin/usuarios', (req, res) => {
+  db.all(
+    `SELECT u.id, u.nombre, u.email, u.plan, u.estado_pago, u.fecha_registro, 
+            COUNT(h.id) as cantidad_hijos 
+     FROM usuarios u 
+     LEFT JOIN hijos h ON u.id = h.usuario_id 
+     GROUP BY u.id`,
+    (err, usuarios) => {
+      if (err) {
+        return res.status(500).json({ error: 'Error al obtener usuarios' });
+      }
+      res.json(usuarios);
+    }
+  );
 });
 
-// ═══════════════════════════════════════════════════════════
-// INICIAR SERVIDOR
-// ═══════════════════════════════════════════════════════════
+// Detalles de usuario
+app.get('/api/admin/usuarios/:id', (req, res) => {
+  const { id } = req.params;
 
+  db.get('SELECT * FROM usuarios WHERE id = ?', [id], (err, usuario) => {
+    if (err || !usuario) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
+    db.all('SELECT * FROM hijos WHERE usuario_id = ?', [id], (err, hijos) => {
+      db.all('SELECT * FROM pagos WHERE usuario_id = ?', [id], (err, pagos) => {
+        res.json({
+          usuario,
+          hijos,
+          pagos
+        });
+      });
+    });
+  });
+});
+
+// ========== SALUD ==========
+
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'OK', mensaje: 'Backend funcionando' });
+});
+
+// Puerto
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`
-╔════════════════════════════════════════╗
-║  🌿 MEMORI BACKEND FUNCIONANDO ✅      ║
-║  Puerto: ${PORT}                          ║
-║  URL: http://localhost:${PORT}          ║
-╚════════════════════════════════════════╝
-  `);
+  console.log(`Servidor corriendo en puerto ${PORT}`);
 });
