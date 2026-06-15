@@ -1,0 +1,15 @@
+# Puerto del servidor
+PORT=3001
+
+# JWT Secret (cambiar en producción)
+JWT_SECRET=tu-secreto-super-seguro-cambiar-en-produccion-ahora
+
+# Mercado Pago (agregar después)
+MERCADO_PAGO_ACCESS_TOKEN=tu_access_token_aqui
+MERCADO_PAGO_PUBLIC_KEY=tu_public_key_aqui
+
+# Frontend URL (para CORS)
+FRONTEND_URL=http://localhost:3000
+
+# Base de datos
+DATABASE_URL=memori.db

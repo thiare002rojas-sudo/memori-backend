@@ -1,0 +1,31 @@
+# Dependencias
+node_modules/
+npm-debug.log
+
+# Variables de entorno (SENSIBLE)
+.env
+.env.local
+.env.*.local
+
+# Base de datos
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Producción
+dist/
+build/
