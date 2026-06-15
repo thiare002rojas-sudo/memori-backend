@@ -3,18 +3,13 @@ const sqlite3 = require('sqlite3').verbose();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
-const mercadopago = require('mercadopago');
+const https = require('https');
 
 const app = express();
 
 // Middleware
 app.use(cors());
 app.use(express.json());
-
-// Configuración de Mercado Pago
-mercadopago.configure({
-  access_token: process.env.MERCADO_PAGO_ACCESS_TOKEN
-});
 
 // Conexión a SQLite
 const db = new sqlite3.Database(process.env.DATABASE_URL || ':memory:');
@@ -71,6 +66,37 @@ const verificarToken = (req, res, next) => {
   } catch (err) {
     res.status(401).json({ error: 'Token inválido' });
   }
+};
+
+// Helper: Llamar API de Mercado Pago
+const callMercadoPagoAPI = (method, path, data) => {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: 'api.mercadopago.com',
+      path: path,
+      method: method,
+      headers: {
+        'Authorization': `Bearer ${process.env.MERCADO_PAGO_ACCESS_TOKEN}`,
+        'Content-Type': 'application/json'
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      let body = '';
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(body));
+        } catch (e) {
+          resolve(body);
+        }
+      });
+    });
+
+    req.on('error', reject);
+    if (data) req.write(JSON.stringify(data));
+    req.end();
+  });
 };
 
 // ========== AUTENTICACIÓN ==========
@@ -209,7 +235,7 @@ app.post('/api/usuario/hijos', verificarToken, (req, res) => {
 // ========== MERCADO PAGO - CREAR PREFERENCIA DE PAGO ==========
 
 app.post('/api/pagos/crear', verificarToken, (req, res) => {
-  const { plan } = req.body;
+  const { plan, email } = req.body;
 
   // Validar plan
   const planes = {
@@ -235,7 +261,7 @@ app.post('/api/pagos/crear', verificarToken, (req, res) => {
       }
     ],
     payer: {
-      email: req.body.email || 'cliente@example.com'
+      email: email || 'cliente@example.com'
     },
     back_urls: {
       success: 'https://memori.cl/?pago=exitoso',
@@ -246,23 +272,27 @@ app.post('/api/pagos/crear', verificarToken, (req, res) => {
     notification_url: 'https://memori-backend-1.onrender.com/api/pagos/webhook'
   };
 
-  mercadopago.preferences.create(preference)
+  callMercadoPagoAPI('POST', '/checkout/preferences', preference)
     .then(response => {
-      // Guardar el pago en BD (pendiente)
-      db.run(
-        'INSERT INTO pagos (usuario_id, plan, monto, mercado_pago_id, estado) VALUES (?, ?, ?, ?, ?)',
-        [req.usuario_id, plan, monto, response.body.id, 'pendiente'],
-        (err) => {
-          if (err) {
-            return res.status(500).json({ error: 'Error al guardar pago' });
-          }
+      if (response.id) {
+        // Guardar el pago en BD (pendiente)
+        db.run(
+          'INSERT INTO pagos (usuario_id, plan, monto, mercado_pago_id, estado) VALUES (?, ?, ?, ?, ?)',
+          [req.usuario_id, plan, monto, response.id, 'pendiente'],
+          (err) => {
+            if (err) {
+              return res.status(500).json({ error: 'Error al guardar pago' });
+            }
 
-          res.json({
-            init_point: response.body.init_point, // URL para pagar
-            preference_id: response.body.id
-          });
-        }
-      );
+            res.json({
+              init_point: response.init_point,
+              preference_id: response.id
+            });
+          }
+        );
+      } else {
+        res.status(500).json({ error: 'Error al crear preferencia' });
+      }
     })
     .catch(err => {
       console.error('Error Mercado Pago:', err);
@@ -275,19 +305,21 @@ app.post('/api/pagos/crear', verificarToken, (req, res) => {
 app.post('/api/pagos/webhook', (req, res) => {
   const { type, data } = req.body;
 
+  console.log('Webhook recibido:', type);
+
   // Solo procesar notificaciones de pago
   if (type !== 'payment') {
     return res.sendStatus(200);
   }
 
   // Obtener detalles del pago desde Mercado Pago
-  mercadopago.payment.findById(data.id)
-    .then(response => {
-      const pago = response.body;
+  callMercadoPagoAPI('GET', `/v1/payments/${data.id}`, null)
+    .then(pago => {
       const external_reference = pago.external_reference;
 
       // Validar que el pago fue aprobado
       if (pago.status !== 'approved') {
+        console.log('Pago no aprobado:', pago.status);
         return res.sendStatus(200);
       }
 
@@ -300,6 +332,7 @@ app.post('/api/pagos/webhook', (req, res) => {
         [usuario_id, 'pendiente'],
         (err, pagoPendiente) => {
           if (err || !pagoPendiente) {
+            console.log('Pago pendiente no encontrado');
             return res.sendStatus(200);
           }
 
