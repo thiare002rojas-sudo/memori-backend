@@ -209,6 +209,33 @@ app.post('/api/usuario/hijos', authMW, (req, res) => {
   );
 });
 
+// Actualizar perfil
+app.put('/api/usuario/perfil', authMW, (req, res) => {
+  const { nombre } = req.body;
+  if (!nombre) return res.status(400).json({ error: 'Nombre requerido' });
+  db.run('UPDATE usuarios SET nombre=? WHERE id=?', [nombre.trim(), req.usuario_id], function(err) {
+    if (err || this.changes === 0) return res.status(500).json({ error: 'Error al actualizar' });
+    res.json({ ok: true, nombre: nombre.trim() });
+  });
+});
+
+// Cambiar contraseña
+app.put('/api/usuario/password', authMW, async (req, res) => {
+  const { password_actual, password_nueva } = req.body;
+  if (!password_actual || !password_nueva) return res.status(400).json({ error: 'Faltan campos' });
+  if (password_nueva.length < 8) return res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres' });
+  db.get('SELECT password FROM usuarios WHERE id=?', [req.usuario_id], async (err, user) => {
+    if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+    const ok = await bcrypt.compare(password_actual, user.password);
+    if (!ok) return res.status(401).json({ error: 'La contraseña actual es incorrecta' });
+    const hash = await bcrypt.hash(password_nueva, 10);
+    db.run('UPDATE usuarios SET password=? WHERE id=?', [hash, req.usuario_id], function(e) {
+      if (e) return res.status(500).json({ error: 'Error al cambiar contraseña' });
+      res.json({ ok: true, mensaje: 'Contraseña actualizada correctamente' });
+    });
+  });
+});
+
 // ── PRECIOS PÚBLICOS ──────────────────────────────────────────────────────────
 app.get('/api/precios', (req, res) => {
   db.all('SELECT * FROM precios ORDER BY plan, periodo', (err, rows) => {
