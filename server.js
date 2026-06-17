@@ -31,12 +31,23 @@ const db = new sqlite3.Database(DB_PATH, (err) => {
   else console.log('✅ DB conectada:', DB_PATH);
 });
 
-// Backup automático cada 5 minutos
+// Backup automático cada 3 minutos
 setInterval(() => {
-  if (fs.existsSync(DB_PATH)) {
-    fs.copyFileSync(DB_PATH, BACKUP_PATH);
-  }
-}, 5 * 60 * 1000);
+  try {
+    if (fs.existsSync(DB_PATH)) {
+      fs.copyFileSync(DB_PATH, BACKUP_PATH);
+      console.log('💾 Backup guardado:', new Date().toLocaleTimeString());
+    }
+  } catch(e) { console.error('Backup error:', e.message); }
+}, 3 * 60 * 1000);
+
+// Mantener vivo el servidor (ping a sí mismo cada 10 min para no dormirse en Render free)
+const SELF_URL = process.env.SELF_URL || '';
+if (SELF_URL) {
+  setInterval(() => {
+    fetch(SELF_URL + '/api/health').catch(()=>{});
+  }, 10 * 60 * 1000);
+}
 
 // ── CREAR TABLAS ──────────────────────────────────────────────────────────────
 db.serialize(() => {
@@ -258,6 +269,23 @@ app.post('/api/pagos/transferencia', authMW, (req, res) => {
 });
 
 // ── ADMIN ─────────────────────────────────────────────────────────────────────
+// Endpoint para activar plan directamente (usado por admin)
+app.post('/api/admin/activar-plan', (req, res) => {
+  const { email, plan, clave } = req.body;
+  // Clave simple de admin para proteger este endpoint
+  if (clave !== 'memori_admin_2025') return res.status(403).json({ error: 'No autorizado' });
+  if (!email || !plan) return res.status(400).json({ error: 'Email y plan requeridos' });
+  db.run(
+    "UPDATE usuarios SET plan=?, estado_pago='pagado' WHERE email=?",
+    [plan, email.toLowerCase().trim()],
+    function(err) {
+      if (err) return res.status(500).json({ error: err.message });
+      if (this.changes === 0) return res.status(404).json({ error: 'Usuario no encontrado: ' + email });
+      res.json({ ok: true, mensaje: 'Plan ' + plan + ' activado para ' + email });
+    }
+  );
+});
+
 app.get('/api/admin/stats', adminMW, (req, res) => {
   db.get('SELECT COUNT(*) as total FROM usuarios', (err, r1) => {
     db.get("SELECT COUNT(*) as c FROM pagos WHERE estado='confirmado'", (e2, r2) => {
